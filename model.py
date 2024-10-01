@@ -91,17 +91,113 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class Block(nn.Module):
+# class Block(nn.Module):
 
+#     def __init__(self, config):
+#         super().__init__()
+#         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+#         self.attn = CausalSelfAttention(config)
+#         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+#         self.mlp = MLP(config)
+
+#     def forward(self, x):
+#         x = x + self.attn(self.ln_1(x))
+#         x = x + self.mlp(self.ln_2(x))
+        # return x
+class ConvLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.conv = nn.Conv1d(config.n_embd, config.n_embd, kernel_size=3, padding=1)
+    
+    def forward(self, x):
+        # x shape: (batch, seq_len, n_embd)
+        # Conv1d expects (batch, n_embd, seq_len)
+        x = x.transpose(1, 2)
+        x = self.conv(x)
+        return x.transpose(1, 2)
+
+class ResBlock(nn.Module):
+    def __init__(self, d, r=1, k=3, casual=False, use_bias=False):
+        super(ResBlock, self).__init__()
+        self.d = d # input features
+        self.r = r # dilation size
+        self.k = k # "masked kernel size"
+        ub = use_bias
+        self.layernorm1 = nn.LayerNorm(2*d)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv1x1_1 = nn.Conv1d(2*d, d, kernel_size=1, bias=ub)
+        self.layernorm2 = nn.LayerNorm(d)
+        self.relu2 = nn.ReLU(inplace=True)
+        if casual:
+            padding = (_same_pad(k,r), 0)
+        else:
+            p = samepad(k,r)
+            if p % 2 == 1:
+                padding = [p // 2 + 1, p // 2]
+            else:
+                padding = (p // 2, p // 2)
+        self.pad = nn.ConstantPad1d(padding, 0.)
+        self.maskedconv1xk = nn.Conv1d(d, d, kernel_size=k, dilation=r, bias=ub)
+        self.layernorm3 = nn.LayerNorm(d)
+        self.relu3 = nn.ReLU(inplace=True)
+        self.conv1x1_2 = nn.Conv1d(d, 2*d, kernel_size=1, bias=ub)
+
+    def forward(self, input):
+        x = input
+        x = x.transpose(1, 2)  # Change to (B, L, C) for LayerNorm
+        x = self.layernorm1(x)
+        x = x.transpose(1, 2)  # Change back to (B, C, L) for Conv1d
+        x = self.relu1(x)
+        x = self.conv1x1_1(x)
+        x = x.transpose(1, 2)
+        x = self.layernorm2(x)
+        x = x.transpose(1, 2)
+        x = self.relu2(x)
+        x = self.pad(x)
+        x = self.maskedconv1xk(x)
+        x = x.transpose(1, 2)
+        x = self.layernorm3(x)
+        x = x.transpose(1, 2)
+        x = self.relu3(x)
+        x = self.conv1x1_2(x)
+        x += input
+        return x
+
+def _same_pad(k, r):
+    return (k - 1) * r
+
+def samepad(k, r):
+    return (k - 1) * r
+
+class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        
+        self.resblock = ResBlock(d=config.n_embd // 2,
+                                 r=getattr(config, 'resblock_dilation', 1),
+                                 k=getattr(config, 'resblock_kernel', 3),
+                                 casual=getattr(config, 'resblock_casual', True),
+                                 use_bias=config.bias)
+        
         self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
+        
+        # Prepare input for ResBlock
+        # b, t, c = x.size()
+        x_reshaped = x.transpose(1, 2).contiguous()
+        
+        # Apply ResBlock
+        x_resblock = self.resblock(x_reshaped)
+        
+        # Reshape back and add residual connection
+        x_resblock = x_resblock.transpose(1, 2).contiguous()
+        x = x + x_resblock
+        
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -184,7 +280,10 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # Compute the cross-entropy loss (in nats)
+            loss_nats = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # Convert to bpc
+            loss = loss_nats * math.log2(math.e)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
