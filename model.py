@@ -91,30 +91,19 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-# class Block(nn.Module):
+class Block(nn.Module):
 
-#     def __init__(self, config):
-#         super().__init__()
-#         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-#         self.attn = CausalSelfAttention(config)
-#         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-#         self.mlp = MLP(config)
-
-#     def forward(self, x):
-#         x = x + self.attn(self.ln_1(x))
-#         x = x + self.mlp(self.ln_2(x))
-        # return x
-class ConvLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.conv = nn.Conv1d(config.n_embd, config.n_embd, kernel_size=3, padding=1)
-    
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
     def forward(self, x):
-        # x shape: (batch, seq_len, n_embd)
-        # Conv1d expects (batch, n_embd, seq_len)
-        x = x.transpose(1, 2)
-        x = self.conv(x)
-        return x.transpose(1, 2)
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
 
 class ResBlock(nn.Module):
     def __init__(self, d, r=1, k=3, casual=False, use_bias=False):
@@ -169,7 +158,7 @@ def _same_pad(k, r):
 def samepad(k, r):
     return (k - 1) * r
 
-class Block(nn.Module):
+class ConvBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -219,6 +208,8 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        BlockType = ConvBlock if config.conv_block else Block
+        
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
