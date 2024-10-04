@@ -158,6 +158,38 @@ def _same_pad(k, r):
 def samepad(k, r):
     return (k - 1) * r
 
+# class Block(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+#         self.attn = CausalSelfAttention(config)
+#         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        
+#         self.resblock = ResBlock(d=config.n_embd // 2,
+#                                  r=getattr(config, 'resblock_dilation', 1),
+#                                  k=getattr(config, 'resblock_kernel', 3),
+#                                  casual=getattr(config, 'resblock_casual', True),
+#                                  use_bias=config.bias)
+        
+#         self.mlp = MLP(config)
+
+#     def forward(self, x):
+#         x = x + self.attn(self.ln_1(x))
+        
+#         # Prepare input for ResBlock
+#         # b, t, c = x.size()
+#         x_reshaped = x.transpose(1, 2).contiguous()
+        
+#         # Apply ResBlock
+#         x_resblock = self.resblock(x_reshaped)
+        
+#         # Reshape back and add residual connection
+#         x_resblock = x_resblock.transpose(1, 2).contiguous()
+#         x = x + x_resblock
+        
+#         x = x + self.mlp(self.ln_2(x))
+#         return x
+
 class ConvBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -172,23 +204,41 @@ class ConvBlock(nn.Module):
                                  use_bias=config.bias)
         
         self.mlp = MLP(config)
+        self.config = config
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        
-        # Prepare input for ResBlock
-        # b, t, c = x.size()
-        x_reshaped = x.transpose(1, 2).contiguous()
-        
-        # Apply ResBlock
-        x_resblock = self.resblock(x_reshaped)
-        
-        # Reshape back and add residual connection
-        x_resblock = x_resblock.transpose(1, 2).contiguous()
-        x = x + x_resblock
-        
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        if self.config.parallel:
+            
+            x_reshaped = self.ln_1(x).transpose(1, 2).contiguous()
+            
+            # Apply ResBlock
+            x_resblock = self.resblock(x_reshaped)
+            
+            # Reshape back and add residual connection
+            x_resblock = x_resblock.transpose(1, 2).contiguous()
+
+            # Add attn and conv in parallel
+            x = x + self.attn(self.ln_1(x)) + x_resblock
+
+            x = x + self.mlp(self.ln_2(x))
+            return x
+
+        else:
+            x = x + self.attn(self.ln_1(x))
+            
+            # Prepare input for ResBlock
+            # b, t, c = x.size()
+            x_reshaped = x.transpose(1, 2).contiguous()
+            
+            # Apply ResBlock
+            x_resblock = self.resblock(x_reshaped)
+            
+            # Reshape back and add residual connection
+            x_resblock = x_resblock.transpose(1, 2).contiguous()
+            x = x + x_resblock
+            
+            x = x + self.mlp(self.ln_2(x))
+            return x
 
 @dataclass
 class GPTConfig:
@@ -199,6 +249,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    conv_block: bool = True
+    parallel: bool = False
 
 class GPT(nn.Module):
 
@@ -208,13 +260,13 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        BlockType = ConvBlock if config.conv_block else Block
+        BlockType = ConvBlock if self.config.conv_block else Block
         
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([BlockType(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
