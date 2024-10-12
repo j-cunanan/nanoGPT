@@ -106,7 +106,7 @@ class Block(nn.Module):
         return x
 
 class ResBlock(nn.Module):
-    def __init__(self, d, r=1, k=3, casual=False, use_bias=False):
+    def __init__(self, d, r=1, k=3, casual=True, use_bias=False):
         super(ResBlock, self).__init__()
         self.d = d # input features
         self.r = r # dilation size
@@ -120,7 +120,7 @@ class ResBlock(nn.Module):
         if casual:
             padding = (_same_pad(k,r), 0)
         else:
-            p = samepad(k,r)
+            p = _samepad(k,r)
             if p % 2 == 1:
                 padding = [p // 2 + 1, p // 2]
             else:
@@ -153,10 +153,7 @@ class ResBlock(nn.Module):
         return x
 
 def _same_pad(k, r):
-    return (k - 1) * r
-
-def samepad(k, r):
-    return (k - 1) * r
+    return math.ceil(r*(k - 1))
 
 # class Block(nn.Module):
 #     def __init__(self, config):
