@@ -5,9 +5,7 @@ import numpy as np
 from model import GPTConfig, GPT
 
 # Evaluation settings
-out_dir = 'out-enwiki8-char-mod'
-eval_interval = 250
-eval_iters = 200
+out_dir = 'out-enwiki8-char-parallel'
 dataset = 'enwiki8'
 batch_size = 64
 block_size = 256
@@ -20,13 +18,8 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=ptdtype)
 
 # Data loading function
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
+def get_data(split):
+    return np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
 
 # Load the trained model
 def load_model(ckpt_path):
@@ -46,18 +39,28 @@ def load_model(ckpt_path):
 
 # Evaluation function
 @torch.no_grad()
-def estimate_loss(model):
-    out = {}
-    model.eval()  # Ensure the model is in eval mode
-    for split in ['train', 'val', 'test']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    return out
+def evaluate_full_set(model, split):
+    model.eval()
+    data = get_data(split)
+    total_loss = 0
+    num_batches = len(data) // (batch_size * block_size)
+    
+    for i in range(num_batches):
+        start_idx = i * batch_size * block_size
+        end_idx = start_idx + batch_size * block_size
+        batch_data = data[start_idx:end_idx].reshape(batch_size, block_size)
+        
+        x = torch.from_numpy(batch_data.astype(np.int64)).to(device)
+        y = torch.from_numpy(np.roll(batch_data, -1, axis=1).astype(np.int64)).to(device)
+        
+        with ctx:
+            logits, loss = model(x, y)
+        total_loss += loss.item()
+        
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{num_batches} batches")
+    
+    return total_loss / num_batches
 
 if __name__ == '__main__':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
@@ -67,43 +70,57 @@ if __name__ == '__main__':
     print(f"Iteration: {checkpoint['iter_num']}")
     print(f"Best validation loss: {checkpoint['best_val_loss']:.4f}")
 
-    print(f"\nInitial model mode: {'eval' if not model.training else 'train'}")
-
-    # Evaluate the model
-    t0 = time.time()
-    losses = estimate_loss(model)
-    t1 = time.time()
-    
-    print(f"Train loss: {losses['train']:.4f}")
-    print(f"Validation loss: {losses['val']:.4f}")
-    print(f"Test loss: {losses['test']:.4f}")
-    print(f"Evaluation time: {(t1-t0)*1000:.2f}ms")
+    # Evaluate the model on full val and test sets
+    for split in ['val', 'test']:
+        t0 = time.time()
+        loss = evaluate_full_set(model, split)
+        t1 = time.time()
+        
+        print(f"\nFull {split} set loss: {loss:.4f}")
+        print(f"Evaluation time: {(t1-t0):.2f} seconds")
 
     print("\nModel configuration:")
     for k, v in model.config.__dict__.items():
         print(f"{k}: {v}")
 
-    # Try a single forward pass for each dataset
-    for split in ['train', 'val', 'test']:
-        X, Y = get_batch(split)
-        model.eval()
-        with ctx:
-            logits, loss = model(X, Y)
-        print(f"\nSingle batch {split} loss: {loss.item():.4f}")
-
-    # Final check of model mode
-    print(f"\nFinal model mode: {'eval' if not model.training else 'train'}")
-
     # Print PyTorch version
     print(f"\nPyTorch version: {torch.__version__}")
 
     # Print data statistics
-    for split in ['train', 'val', 'test']:
-        data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
+    for split in ['val', 'test']:
+        data = get_data(split)
         print(f"{split} data shape: {data.shape}")
         print(f"{split} data min: {data.min()}, max: {data.max()}")
 
-    # Calculate bits per byte
-    print("\nBits per byte:")
-    for split, loss in losses.items():
-        print(f"{split}: {loss:.4f}")
+
+# Iteration: 953500
+# Best validation loss: 1.2476
+# Processed 100/305 batches
+# Processed 200/305 batches
+# Processed 300/305 batches
+
+# Full val set loss: 1.3126
+# Evaluation time: 6.98 seconds
+# Processed 100/305 batches
+# Processed 200/305 batches
+# Processed 300/305 batches
+
+# Full test set loss: 1.3145
+# Evaluation time: 6.82 seconds
+
+# Model configuration:
+# block_size: 256
+# vocab_size: 205
+# n_layer: 12
+# n_head: 12
+# n_embd: 384
+# dropout: 0.2
+# bias: False
+# conv_block: True
+# parallel: True
+
+# PyTorch version: 2.6.0.dev20240929+cu124
+# val data shape: (5000000,)
+# val data min: 0, max: 204
+# test data shape: (5000000,)
+# test data min: 0, max: 203
